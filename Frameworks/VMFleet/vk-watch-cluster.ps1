@@ -26,10 +26,9 @@ SOFTWARE.
 #>
 
 param(
-    $SampleInterval = 2,
+    $SampleInterval = 3,
     [ValidateSet("CSV FS","SSB Cache","SBL","S2D BW","Hyper-V LCPU","SMB SRV","*")]
-    #[string[]] $sets = "CSV FS",
-    [string[]] $sets = "Test",
+    [string[]] $sets = "CSV FS",
     $log = $null
 )
 
@@ -252,9 +251,8 @@ function get-samples(
 
 $allctrs = @()
 
-
 ###
-$c = [CounterColumnSet]::new("Test")
+$c = [CounterColumnSet]::new("CSV FS")
 $c.Add([CounterColumn]::new("IOPS", "PhysicalDisk", @("Disk Reads/sec","Disk Writes/sec"), 12, '#,#', 1, 'Sum', $false))
 $c.Add([CounterColumn]::new("Reads", "PhysicalDisk", @("Disk Reads/sec"), 12, '#,#', 1, 'Sum',  $false))
 $c.Add([CounterColumn]::new("Writes", "PhysicalDisk", @("Disk Writes/sec"), 12, '#,#', 1, 'Sum',  $false))
@@ -265,29 +263,6 @@ $c.Add([CounterColumn]::new("Write", "PhysicalDisk", @("Disk Write Bytes/sec"), 
 
 $c.Add([CounterColumn]::new("Read Lat (ms)", "PhysicalDisk", @("Avg. Disk sec/Read"), 15, '0.000', 1000, 'Average', $true))
 $c.Add([CounterColumn]::new("Write Lat", "PhysicalDisk", @("Avg. Disk sec/Write"), 15, '0.000', 1000, 'Average', $false))
-
-$c.Seal()
-$allctrs += $c
-
-
-##
-$c = [CounterColumnSet]::new("S2D BW")
-
-$c.Add([CounterColumn]::new("CSV(MB/s)", "Cluster CSVFS", @("Read Bytes/sec","Write Bytes/sec"), 10, '#,#', 0.000001, 'Sum', $false))
-$c.Add([CounterColumn]::new("CSVRead", "Cluster CSVFS", @("Read Bytes/sec"), 8, '#,#', 0.000001, 'Sum', $false))
-$c.Add([CounterColumn]::new("CSVWrite", "Cluster CSVFS", @("Write Bytes/sec"), 8 ,'#,#', 0.000001, 'Sum', $false))
-
-$c.Add([CounterColumn]::new("SBL(MB/s)", "Cluster Disk Counters", @("Read - Bytes/sec","Write - Bytes/sec"), 10, '#,#', 0.000001, 'Sum', $true))
-$c.Add([CounterColumn]::new("SBLRead", "Cluster Disk Counters", @("Read - Bytes/sec"), 8, '#,#', 0.000001, 'Sum', $false))
-$c.Add([CounterColumn]::new("SBLWrite", "Cluster Disk Counters", @("Write - Bytes/sec"), 8, '#,#', 0.000001, 'Sum', $false))
-
-$c.Add([CounterColumn]::new("Disk(MB/s)", "Cluster Storage Hybrid Disks", @("Disk Read Bytes/sec","Disk Write Bytes/sec"), 11, '#,#', 0.000001, 'Sum', $true))
-$c.Add([CounterColumn]::new("DiskRead", "Cluster Storage Hybrid Disks", @("Disk Read Bytes/sec"), 10, '#,#', 0.000001, 'Sum', $false))
-$c.Add([CounterColumn]::new("DiskWrite", "Cluster Storage Hybrid Disks", @("Disk Write Bytes/sec"), 10, '#,#', 0.000001, 'Sum', $false))
-
-$c.Add([CounterColumn]::new("Cache(MB/s)", "Cluster Storage Hybrid Disks", @("Cache Hit Read Bytes/sec","Cache Write Bytes/sec"), 12, '#,#', 0.000001, 'Sum', $true))
-$c.Add([CounterColumn]::new("CacheRead", "Cluster Storage Hybrid Disks", @("Cache Hit Read Bytes/sec"), 10, '#,#', 0.000001, 'Sum', $false))
-$c.Add([CounterColumn]::new("CacheWrite", "Cluster Storage Hybrid Disks", @("Cache Write Bytes/sec"), 10, '#,#', 0.000001, 'Sum', $false))
 
 $c.Seal()
 $allctrs += $c
@@ -308,7 +283,7 @@ function start-sample(
     # some display counter sets may repeat specific values (which is fine)
     $counters = ($ctrs.counters |% { $_ |% { $_ }} | group -NoElement).Name
 
-    icm -AsJob -JobName watch-cluster (Get-ClusterNode) {
+    icm -AsJob -ThrottleLimit 100 -JobName watch-cluster (Get-ClusterNode) {
 
         # extract countersamples, the object does not survive transfer between powershell sessions
         # extract as a list, not as the individual counters
@@ -326,6 +301,7 @@ $skipone = $false
 # hash of most recent samples/node
 $samples = @{}
 Get-ClusterNode |% { $samples[$_.Name] = $null }
+$my_nodes = Get-ClusterNode | Where-Object Name -Match "^node-\d{1,2}$"
 
 while ($true) {
 
@@ -341,6 +317,13 @@ while ($true) {
     # receive updates into the per-node hash
     foreach ($child in $j.ChildJobs) {
         $samples[$child.Location] = $child | receive-job -ErrorAction SilentlyContinue
+    }
+
+    $my_samples = @{}
+    foreach($key in $samples.Keys) {
+        if($key -match 'node-\d{1,2}$'){
+            $my_samples[$key] = $samples[$key]
+        }
     }
 
     # null out downed nodes and remember first time we saw one drop out
@@ -371,31 +354,38 @@ while ($true) {
     # now process samples into per-node hashes of set/ctr containing lists of the
     # cooked values acrosss the (possible) multiple instances
     $psamples = @{}
-    foreach ($node in $samples.keys) {
+    $my_psamples = @{}
 
-        if ($samples[$node]) {
-
+    foreach ($nodes in $my_nodes) {
+        $group_nodes =(Get-ClusterNode | Where-Object Name -Match "$nodes$|$nodes-vm-").Name
+        $my_nsamples = @{}
+        foreach ($group_node in $group_nodes){
             $nsamples = @{}
-
-            # flatten samples - if we are lagging, we'll have a list
-            # of consecutive (increasing by timestamp) samples
-            # we could try to be more efficient by dumping all but the
-            # final sample, but later ...
-            $samples[$node] |% { $_ } |% {
-
+            $samples[$group_node] |% { $_ } |% {
                 ($setinst,$ctr) = $($_.path -split '\\')[3..4]
                 $set = ($setinst -split '\(')[0]
 
                 $k = "$set+$ctr"
                 $nsamples[$k] = $_.cookedvalue
             }
-
-            $psamples[$node] = $nsamples
+            if ($my_nsamples.Count -eq 0){
+                $my_nsamples = $nsamples
+            }
+            else {
+                foreach($ns in $nsamples.Keys){
+                 $my_nsamples[$ns] = $my_nsamples[$ns] + $nsamples[$ns]   
+                }
+            }
         }
+        $my_nsamples["physicaldisk+avg. disk sec/read"] = $my_nsamples["physicaldisk+avg. disk sec/read"] * 40
+        $my_nsamples["physicaldisk+avg. disk sec/write"] = $my_nsamples["physicaldisk+avg. disk sec/write"] * 40
+        $my_psamples[$nodes.Name] = $my_nsamples 
     }
 
+
     # post-process the samples into the counterset, then clear and dump
-    $ctrs.DisplayPre($samples, $psamples)
+    #$ctrs.DisplayPre($samples, $psamples)
+    $ctrs.DisplayPre($my_samples, $my_psamples)
     cls
     $drawsep = $false
     $ctrs |% {
